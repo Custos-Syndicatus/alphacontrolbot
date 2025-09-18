@@ -14,7 +14,7 @@ def check_environment():
     
     load_dotenv()
     
-    required_vars = ['API_ID', 'API_HASH', 'BOT_TOKEN']
+    required_vars = ['API_ID', 'API_HASH', 'BOT_TOKEN', 'SALT']
     missing_vars = []
     
     for var in required_vars:
@@ -28,6 +28,13 @@ def check_environment():
     
     print("✅ All required environment variables are set")
     
+    # Check SALT length for security
+    salt = os.getenv('SALT', '')
+    if len(salt) < 16:
+        print("⚠️  SALT should be at least 16 characters for security")
+    else:
+        print("✅ SALT configured with adequate length")
+    
     # Check optional variables
     banned_words = os.getenv('BANNED_WORDS', '')
     if banned_words:
@@ -36,11 +43,7 @@ def check_environment():
     else:
         print("⚠️  No banned words configured")
     
-    group_id = os.getenv('GROUP_ID')
-    if group_id:
-        print(f"🎯 Specific group ID configured: {group_id}")
-    else:
-        print("🌐 Bot will monitor all groups it's added to")
+    print("🌐 Bot will monitor all groups it's added to (always-on mode)")
     
     return True
 

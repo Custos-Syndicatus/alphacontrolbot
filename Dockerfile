@@ -10,11 +10,17 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY bot.py .
-COPY .env* ./
 
 # Create a non-root user
-RUN useradd --create-home --shell /bin/bash botuser
-RUN chown -R botuser:botuser /app
+RUN useradd --create-home --shell /bin/bash botuser && \
+    chown -R botuser:botuser /app
+
+# Create data directory and set permissions
+RUN mkdir -p /data && chown -R botuser:botuser /data
+
+# Declare volume for persistent data
+VOLUME /data
+
 USER botuser
 
 # Command to run the bot
