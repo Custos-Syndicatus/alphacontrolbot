@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  xcontroller:
+    build: .
+    container_name: xcontroller-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+      - ./bot.session:/app/bot.session
+    environment:
+      - PYTHONUNBUFFERED=1
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
