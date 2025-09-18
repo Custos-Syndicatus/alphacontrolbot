@@ -8,8 +8,7 @@ services:
     env_file:
       - .env
     volumes:
-      - ./logs:/app/logs
-      - ./bot.session:/app/bot.session
+      - ./data:/data
     environment:
       - PYTHONUNBUFFERED=1
     logging:
