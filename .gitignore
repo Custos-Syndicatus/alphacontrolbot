@@ -31,6 +31,10 @@ venv/
 env/
 ENV/
 
+# Data directory (runtime files)
+data/
+/data
+
 # Telethon session files
 *.session
 *.session-journal
