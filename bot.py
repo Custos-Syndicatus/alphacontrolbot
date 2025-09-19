@@ -249,6 +249,19 @@ class TelegramAdminBot:
         banned_words_str = os.getenv('BANNED_WORDS', '')
         self.banned_words = set(word.strip().lower() for word in banned_words_str.split(',') if word.strip())
         
+        # Manual forward group IDs from environment
+        forward_group_ids_str = os.getenv('FORWARD_GROUP_IDS', '')
+        self.manual_forward_groups = []
+        if forward_group_ids_str.strip():
+            try:
+                # Parse comma-separated list of integers
+                group_ids = [int(gid.strip()) for gid in forward_group_ids_str.split(',') if gid.strip()]
+                self.manual_forward_groups = group_ids
+                logger.info(f"Loaded {len(self.manual_forward_groups)} forward group IDs from env (manual mode)")
+            except ValueError as e:
+                logger.error(f"Invalid FORWARD_GROUP_IDS format: {e}. Using auto-discovery instead.")
+                self.manual_forward_groups = []
+        
         # Validate required environment variables
         if not all([self.api_id, self.api_hash, self.bot_token, self.salt]):
             raise ValueError("Missing required environment variables: API_ID, API_HASH, BOT_TOKEN, SALT")
@@ -274,7 +287,7 @@ class TelegramAdminBot:
         await self.client.start(bot_token=self.bot_token)
         logger.info("Bot started successfully")
         
-        # Discover groups for forwarding (up to 20)
+        # Setup forwarding groups (manual or auto-discovery)
         await self.discover_forward_groups()
         
         # Register event handlers
@@ -287,7 +300,16 @@ class TelegramAdminBot:
         logger.info("Event handlers registered, bot is running...")
     
     async def discover_forward_groups(self):
-        """Discover groups the bot can forward to (max 20)"""
+        """Setup groups for forwarding (manual or auto-discovery)"""
+        # Use manual group IDs if provided
+        if self.manual_forward_groups:
+            self.forward_groups = self.manual_forward_groups.copy()
+            logger.info(f"Using manual forward groups: {len(self.forward_groups)} groups configured")
+            logger.info("Skipping auto-discovery because FORWARD_GROUP_IDS provided")
+            return
+        
+        # Fallback to auto-discovery with best-effort error handling
+        logger.info("FORWARD_GROUP_IDS not provided, attempting auto-discovery as fallback")
         self.forward_groups = []
         try:
             async for dialog in self.client.iter_dialogs():
@@ -300,9 +322,10 @@ class TelegramAdminBot:
                         # Skip groups where bot doesn't have permissions
                         continue
             
-            logger.info(f"Discovered {len(self.forward_groups)} groups for forwarding")
+            logger.info(f"Auto-discovered {len(self.forward_groups)} groups for forwarding")
         except Exception as e:
-            logger.error(f"Error discovering forward groups: {e}")
+            logger.error(f"Error in auto-discovery (non-fatal): {e}")
+            logger.info("Bot will continue without forwarding groups")
     
     async def handle_new_member(self, event):
         """Handle new members joining the group"""
@@ -372,6 +395,15 @@ class TelegramAdminBot:
             
             if not message_text:
                 return
+            
+            # Handle /id command
+            if message_text.strip().lower() == '/id':
+                try:
+                    await event.reply(f"Chat ID: {event.chat_id}")
+                    return
+                except Exception as e:
+                    logger.error(f"Error responding to /id command: {e}")
+                    return
             
             # Check for banned words
             if self.contains_banned_words(message_text):
