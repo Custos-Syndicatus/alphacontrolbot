@@ -116,4 +116,4 @@ MIT — see [LICENSE](LICENSE)
 
 ---
 
-**Made with ❤️ by AndroDoge**
+**Made with ❤️, curiosity and Linux by AndroDoge**
