@@ -163,6 +163,133 @@ python bot.py
 
 ---
 
+## 🐳 Docker Deployment
+
+### Quick Start
+
+**1. Clone & configure:**
+```bash
+git clone https://github.com/your-org/your-repo.git
+cd your-repo
+cp .env.example .env
+```
+
+**2. Edit `.env` with your values:**
+```bash
+# Required: Get from https://my.telegram.org/apps
+API_ID=123456
+API_HASH=your_api_hash_here
+BOT_TOKEN=1234567890:AA...your_bot_token_here
+
+# Required: Target group numeric ID
+ALLOWED_GROUP_ID=-1001234567890123
+
+# Required: Admin user IDs (comma-separated)
+ADMIN_USER_IDS=11111111,22222222
+
+# Required: Strong encryption passphrase
+DB_PASSPHRASE=change_this_to_a_strong_random_passphrase
+```
+
+**3. Build & run:**
+```bash
+docker-compose up -d
+```
+
+### Security Best Practices
+
+⚠️ **Critical Security Requirements:**
+
+- **Never commit `.env` files** – Contains sensitive credentials
+- **Use strong `DB_PASSPHRASE`** – If lost, data is unrecoverable  
+- **Protect admin user IDs** – Only trusted users should have control
+- **Secure host access** – Limit SSH/access to Docker host
+- **Regular backups** – Backup `./data` directory if using fixed SALT
+
+### Docker Commands
+
+**Build locally:**
+```bash
+docker build -t xcontroller-bot .
+```
+
+**Run with custom config:**
+```bash
+docker run -d \
+  --name xcontroller-bot \
+  --env-file .env \
+  -v $(pwd)/data:/data \
+  xcontroller-bot
+```
+
+**View logs:**
+```bash
+docker-compose logs -f xcontroller
+```
+
+**Stop/start:**
+```bash
+docker-compose stop
+docker-compose start
+```
+
+**Update & rebuild:**
+```bash
+docker-compose down
+git pull
+docker-compose up -d --build
+```
+
+### Data Persistence
+
+- **Database**: Stored in `./data/bot.enc.db` (SQLCipher encrypted)
+- **Logs**: Stored in `./data/bot.log`
+- **Session**: Telegram session files in `./data/`
+
+The `./data` directory is mounted as a Docker volume for persistence across container restarts.
+
+### Environment Variables Reference
+
+| Variable | Required | Description | Security Notes |
+|----------|----------|-------------|----------------|
+| `API_ID` | ✅ | Telegram API ID | Public, but keep secure |
+| `API_HASH` | ✅ | Telegram API hash | **Secret** - never share |
+| `BOT_TOKEN` | ✅ | BotFather token | **Secret** - never share |
+| `ALLOWED_GROUP_ID` | ✅ | Target group ID | Public info |
+| `ADMIN_USER_IDS` | ✅ | Admin user IDs | Sensitive - limit access |
+| `DB_PASSPHRASE` | ✅ | Encryption key | **Critical secret** |
+| `SALT` | ❌ | Fixed salt (optional) | Secret if provided |
+| `BANNED_WORDS` | ❌ | Initial banned words | Operational data |
+
+### Troubleshooting
+
+**Container won't start:**
+```bash
+# Check logs
+docker-compose logs xcontroller
+
+# Check configuration
+docker-compose config
+```
+
+**Database issues:**
+```bash
+# Check data directory permissions
+ls -la ./data
+
+# Restart with fresh database (⚠️ loses data)
+rm -f ./data/bot.enc.db
+docker-compose restart
+```
+
+**Network connectivity:**
+```bash
+# Test from inside container
+docker-compose exec xcontroller ping telegram.org
+```
+
+---
+
 ## ▶ First Use Flow
 
 1. Deploy & start (bot is INACTIVE).
