@@ -1,225 +1,276 @@
-# XController Telegram Admin Bot (Enhanced)
+# ⚔️ XController – Secure Telegram Moderation Bot (Single-Group, Hardened)
 
-Älykäs Telegram-hallintabotti, joka pysyy täysin passiivisena kunnes aktivoidaan adminin DM:llä. Tukee kiellettyjen sanojen moderointia, progressiivista kurinpitoa (mute -> ban), sekä vain adminien yksityisviesteihin reagoivaa ohjausmallia.
+> Ultra-focused, security‑centric moderation bot for ONE Telegram group.  
+> Passive until explicitly activated. Encrypted, anonymized, rate-aware, salt-rotating.  
+> Built for stealthy, consistent, controlled enforcement.
 
-## Sisällys
-- [Ominaisuudet](#ominaisuudet)
-- [Pika-aloitus](#pika-aloitus)
-- [Ympäristömuuttujat](#ympäristömuuttujat)
-- [Aktivointi](#aktivointi)
-- [Admin-only DM -toiminta](#admin-only-dm)
-- [/orwell Multi-Add -komento](#orwell-multi-add)
-- [SALT ja anonymisointi](#salt-ja-anonymisointi)
-- [Moderointilogiikka](#moderointilogiikka)
-- [Hakemistorakenne ja data](#hakemistorakenne-ja-data)
-- [Kehitysympäristö (virtualenv)](#kehitysympäristö-virtualenv)
-- [Lokitus](#lokitus)
-- [Turvallisuusnäkökulmia](#turvallisuusnäkökulmia)
-- [Roadmap / Mahdolliset jatkokehitykset](#roadmap--mahdolliset-jatkokehitykset)
-- [Lisenssi](#lisenssi)
+---
 
-## Ominaisuudet
-1. Aktivointivaihde: botti ei tee mitään ennen kuin admin DM: *activate*.
-2. Admin-only ohjaus: vain ADMIN_USER_IDS -listatut käyttäjät saavat vastauksen / voivat ohjata botin toimintaa.
-3. /orwell komento tukee useiden sanojen lisäämistä kerralla pilkuilla eroteltuna.
-4. Dynaaminen kiellettyjen sanojen lista tallennettuna SQLiteen.
-5. Banned word -valvonta: ensimmäinen rikkomus -> viesti poistetaan + 12h mute + lyhyt varoitus (auto-delete); toinen rikkomus 7 päivän sisällä -> pysyvä ban.
-6. Käyttäjä-ID:t anonymisoidaan HMAC-SHA256 + SALT -kombolla (ei raakatekstisiä ID:itä tietokannassa).
-7. SALT generoidaan tarvittaessa automaattisesti (volatiili varoituksella).
-8. Uudet jäsenet ilman käyttäjänimeä potkitaan (vain aktivoituna).
-9. Kevyt token bucket -rate limiter (valmius jatkolaajennuksiin).
-10. Lokitus tiedostoon + konsoliin.
+## 🚀 Core Value
 
-## Pika-aloitus
+| Aspect | Benefit |
+|--------|---------|
+| 🔐 Data Protection | Encrypted DB (SQLCipher) + keyed BLAKE2b anonymization |
+| 🛡 Controlled Scope | Only acts in a single configured group (ALLOWED_GROUP_ID) |
+| 🧪 Safety First | Passive until admin activates via DM |
+| 🔁 Key Hygiene | Daily automatic salt rotation (if no fixed SALT provided) |
+| 🔇 Silent Hardening | Ignores all non-admin DMs (unless tracking for spam) |
+| 🧩 Flexible Banned Words | Multi-add with `/orwell word1,word2,...` |
+| ⚠ Progressive Discipline | Delete → Mute (12h) → Permanent Ban |
+| 🕵 DM Spam Defense | Silent ban/block if threshold exceeded |
+| 🔄 Edited & Forwarded Message Coverage | Re-scans edits, treats forwarded message text equally |
+| 📉 Minimal Disclosure | Aggregated metrics only (/status) – no user hashes shown |
 
+---
+
+## 🧬 Feature Overview
+
+### Activation Gate
+- State persists in encrypted DB (`activation_state`).
+- Admin DM: `activate`
+- Already active? Reply: `Already active.`
+
+### Single Group Enforcement
+- Strictly processes events only from `ALLOWED_GROUP_ID`.
+- Any other chat → ignored (defense-in-depth).
+
+### Message Moderation
+- Scans: new messages, edited messages, forwarded messages.
+- Deletes immediately on banned-word detection.
+- Penalty progression (7-day window):
+  1. First: delete + 12h mute + ephemeral warning (auto-deletes in 30s)
+  2. Second+: permanent ban
+
+### Banned Words
+- Multi-add: `/orwell fraud, scam , spam`
+- Response summary: `Added: fraud, scam | Skipped: spam`
+- Detection:
+  - Word boundary token match
+  - Substring fallback (aggressive, catches embedded forms)
+- Stored lowercased in encrypted DB.
+
+### DM Spam Throttling
+- Non-admin sending > `DM_SPAM_THRESHOLD` DMs (within `DM_SPAM_WINDOW_DAYS`) ⇒
+  - Silent ban from group
+  - Telegram block via Contacts.Block
+  - No notification to sender
+  - Count resets weekly (window-based)
+- Admin DMs never counted.
+
+### Admin Commands (DM Only)
+| Command | Purpose |
+|---------|---------|
+| `activate` | Enable enforcement if inactive |
+| `/orwell word1,word2` | Add banned words |
+| `/status` | Show operational metrics |
+| (anything else) | Returns help text |
+
+### /status Output (Aggregate Only)
+Shows:
+- Activation state & timestamp
+- Banned word count
+- Violation events (7d)
+- DM spam totals & actioned count
+- Salt mode (Fixed vs Rotating)
+- Next rotation (if rotating)
+- Hash function (keyed BLAKE2b)
+- Substring detection ON
+
+No user-identifying material. No hash tokens displayed.
+
+---
+
+## 🔐 Security Architecture
+
+| Layer | Mechanism | Notes |
+|-------|-----------|-------|
+| Data-at-Rest | SQLCipher (pysqlcipher3) | Requires `DB_PASSPHRASE` |
+| Identity Privacy | Keyed BLAKE2b (digest 256-bit) | No plaintext user IDs in DB |
+| Salt Strategy | Fixed (SALT env) OR rotating (24h) | Rotation clears violation + spam tables |
+| Hash Rotation Impact | Fresh anonymization daily | Predictable privacy boundary |
+| Scope Restriction | ALLOWED_GROUP_ID gating | Eliminates cross-group abuse |
+| DM Stealth | Non-admins receive 0 responses | Reduces probing surface |
+| Spam Abuse Control | Thresholded silent ban/block | No attacker feedback |
+| Config Hardening | Numeric bounds & validation | Prevents extreme values |
+| Logging | Operational only (no PII) | Stored in `data/bot.log` |
+| Forward/Edit Coverage | Re-inspection on edit | Prevents bypass via edits |
+
+### Salt Modes
+| Mode | Trigger | Rotation | Persistence |
+|------|---------|----------|------------|
+| Fixed | `SALT` provided | None | Hash continuity preserved |
+| Rotating | `SALT` unset | Every 24h | Violations & DM spam reset |
+
+---
+
+## 🧪 Substring Detection Explained
+
+Two-tier detection:
+1. Token Match: Exact token equality (fast & precise).
+2. Substring Match: Banned term appears anywhere inside the lowercased text.  
+   Example: banned word `fraud` flags `megaFraudster`.
+
+Pros: catches simple obfuscations.  
+Cons: can cause false positives (`classical` contains `ass`).  
+(You can later make this configurable.)
+
+---
+
+## 🔧 Environment Variables
+
+| Name | Required | Example | Description |
+|------|----------|---------|-------------|
+| API_ID | Yes | 123456 | Telegram API ID |
+| API_HASH | Yes | abcd1234... | Telegram API hash |
+| BOT_TOKEN | Yes | 12345:AA... | BotFather token |
+| ALLOWED_GROUP_ID | Yes | -1001234567890 | Single target supergroup ID |
+| ADMIN_USER_IDS | Yes (practical) | 1111,2222 | Admin numeric user IDs |
+| DB_PASSPHRASE | Yes | strongpassphrase | SQLCipher encryption key |
+| BANNED_WORDS | No | spam,scam | Initial banned words |
+| SALT | No | 9f... | Provide to disable rotation |
+| DM_SPAM_THRESHOLD | No | 50 | Non-admin DM limit (clamped 5–1000) |
+| DM_SPAM_WINDOW_DAYS | No | 7 | DM spam window (1–30) |
+
+If `SALT` omitted → rotating-salt mode engages automatically.
+
+---
+
+## 📦 Installation (Linux Example)
+
+System dependencies for SQLCipher:
 ```bash
-git clone https://github.com/<owner>/<repo>.git
-cd <repo>
-
-# (Suositus) Virtualenv
-python -m venv .venv
-source .venv/bin/activate  # Windows: .\.venv\Scripts\Activate.ps1
-
-pip install -r requirements.txt
-cp .env.example .env   # Luo ympäristömuuttujatiedosto (jos esimerkki olemassa)
-# Muokkaa .env sopivaksi (API_ID, API_HASH, BOT_TOKEN, ADMIN_USER_IDS, jne.)
-
-python bot.py
+sudo apt update
+sudo apt install -y sqlcipher libsqlcipher-dev
 ```
 
-## Ympäristömuuttujat
-
-| Nimi | Pakollinen | Kuvaus |
-|------|------------|--------|
-| `API_ID` | Kyllä | Telegram API ID (my.telegram.org) |
-| `API_HASH` | Kyllä | Telegram API hash |
-| `BOT_TOKEN` | Kyllä | BotFather token |
-| `ADMIN_USER_IDS` | Kyllä (käytännössä) | Pilkuilla eroteltu lista Telegram numeric user ID:itä. Vain nämä ohjaavat bottia. |
-| `BANNED_WORDS` | Ei | Alustava pilkkueroteltu lista kiellettyjä sanoja (lisätään tietokantaan jos ei jo ole). |
-| `SALT` | Ei | Jos puuttuu -> generoidaan volatiili satunnaisheksiarvo (32 bytes -> 64 hex). |
-| `LOG_LEVEL` | Ei | (Mahdollinen lisäys, ei vielä käytössä suoraan) |
-| Muut | - | Ei käytössä tällä versiolla |
-
-Huom: Jos `ADMIN_USER_IDS` on tyhjä, bottia ei voi aktivoida eikä ohjata (varoitus logissa).
-
-## Aktivointi
-
-Bot ei tee mitään ennen kuin admin (ID listassa `ADMIN_USER_IDS`) lähettää yksityisviestin:  
-```
-activate
-```
-- Kirjainkoko väliä (case-insensitive)
-- Ympärillä oleva whitespace siivotaan
-- Tila tallennetaan SQLite `activation_state` -tauluun ja säilyy restartin yli
-- Uusi aktivointiyritys aktiivisena -> vastaus: `Already active.`
-
-## Admin-only DM
-
-Vain admin-ID:t saavat minkään vastauksen. Muut käyttäjät ohitetaan hiljaisesti.  
-Komennot:
-- `activate` (jos ei vielä aktiivinen)
-- `/orwell sana` tai `/orwell sana1,sana2,sana3`
-Muu viesti adminilta palauttaa help-tekstin.
-
-## /orwell Multi-Add
-
-Pilkuilla eroteltu lista lisää useita kiellettyjä sanoja. Tyhjät tokenit siivotaan.
-
-Esimerkki:
-```
-/orwell foo, bar ,baz
-```
-Mahdollinen vastaus:
-```
-Added: foo, bar | Skipped: baz
-```
-(Skipped-osio näytetään vain jos joku oli jo olemassa.)
-
-Tyhjä / kelvoton syöte:
-```
-/orwell , ,
-→ No valid words provided.
-```
-
-Ei tällä hetkellä (tarkoituksella) `list`, `remove` tai `count` alakomentoja.
-
-## SALT ja anonymisointi
-
-- Käytetään HMAC-SHA256: `hmac.new(SALT, user_id_bytes, sha256)`
-- Tietokantaan tallennetaan vain hash (ei raakaa user_id:tä)
-- Jos `SALT` puuttuu → generoidaan satunnaisesti `secrets.token_hex(32)` ja logitetaan WARNING
-- Volatiilin SALT:n seurauksena vanhat hashit eivät enää vastaa samoja käyttäjiä restartin jälkeen (violation-laskurit ikään kuin nollaantuvat käyttäjätasolla)
-
-## Moderointilogiikka
-
-1. Viesti sisältää kielletyn sanan:
-   - Poistetaan
-   - Ensimmäinen rikkomus (7 pv ikkunassa): mute 12h + varoitusviesti (auto-delete 30s)
-   - Toinen tai useampi rikkomus 7 päivän sisällä: pysyvä ban
-2. Rikkomuslaskuri resetoi, jos edellisestä rikkomuksesta > 7 päivää.
-3. Kielletyt sanat haetaan tietokannasta:
-   - Tarkistetaan sekä sanakohtaiset word boundary -osumat että substring fallback (voi halutessa myöhemmin poistaa substring-tarkistuksen).
-4. Kaikki moderointi pysyy pois päältä kunnes aktivoitu.
-
-## Hakemistorakenne ja data
-
-| Polku | Kuvaus |
-|-------|--------|
-| `bot.py` | Päälogiikka |
-| `data/` | Istunto (`bot_session*`), tietokanta `bot.db`, lokitiedosto `bot.log` |
-| `bot.db` | SQLite: taulut `violations`, `banned_words`, `activation_state` |
-
-Jos `/data` ei ole kirjoituskelpoinen → fallback `./data`.
-
-## Kehitysympäristö (virtualenv)
-
-Unix/macOS:
+Clone & setup:
 ```bash
+git clone https://github.com/your-org/your-repo.git
+cd your-repo
 python -m venv .venv
 source .venv/bin/activate
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-Windows (PowerShell):
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
-
-## Lokitus
-
-- Tiedosto: `data/bot.log`
-- Konsoli: sama formaatti
-- Taso: INFO (voit halutessasi muuttaa `basicConfig`-kutsussa)
-- Aktivointitapahtuma: INFO
-- Uusi kielletty sana: INFO
-- Volatiili SALT: WARNING
-- Virheet: ERROR
-
-## Turvallisuusnäkökulmia
-
-| Aihe | Nykytila | Mahdollinen parannus |
-|------|----------|----------------------|
-| SALT hallinta | Ympäristömuuttuja tai volatiili generoitu | Lataa salainen arvo Vault/KMS:stä |
-| Tietokanta | Paikallinen SQLite | Vaihto Postgres + kestävä tallennus jos skaalautuminen |
-| ID anonymisointi | HMAC-SHA256 | Avainten rotaatio + versiointi |
-| Rate limiting | TokenBucket (rakenteena) | Käytä oikeasti DM-spämmin hillintään |
-| Banned words päivitys | Joka viestin yhteydessä uusi haku | Cache + invalidointi lisäyksissä |
-
-## Roadmap / Mahdolliset jatkokehitykset
-
-- `/orwell remove` ja `/orwell list` (valikoiden mukaan)
-- `/stats` adminille: rikkomuslukemat
-- `aiosqlite` → async SQLite
-- Konfiguraatioluokka (Pydantic) ympäristövalidointiin
-- Dockerfile + Compose
-- Health check endpoint (esim. HTTP-portti)
-
-## Esimerkkivirrat
-
-Aktivointi:
-```
-Admin DM: "activate"
-Bot: "Activated."
-```
-
-Lisäys:
-```
-/orwell spam, scam,botnet
-→ Added: spam, scam, botnet
-```
-
-Tyhjä:
-```
-/orwell , ,
-→ No valid words provided.
-```
-
-Uudelleen aktivointi:
-```
-activate
-→ Already active.
-```
-
-## Vianetsintä
-
-| Ongelma | Syy | Ratkaisu |
-|---------|-----|----------|
-| Bot ei reagoi mihinkään | Ei aktivoitu | DM: activate (adminilta) |
-| "Missing required env vars" | API_ID/API_HASH/BOT_TOKEN puuttuu | Lisää .env:iin |
-| Admin DM ei saa vastausta | ADMIN_USER_IDS ei sisällä user ID:täsi | Lisää ID listaan ja restart |
-| Rikkomus ei nollaudu | Alle 7 päivää viimeisestä | Odota yli 7 pv tai muuta koodista logiikkaa |
-
-## Lisenssi
-
-```
-MIT License
-
-Copyright (c) ...
-...
+Run:
+```bash
+cp .env.example .env  # if you maintain one
+# Edit .env with required variables
+python bot.py
 ```
 
 ---
 
-Made with passion and heart by Androdoge / Syndicates
+## ▶ First Use Flow
+
+1. Deploy & start (bot is INACTIVE).
+2. Admin sends DM: `activate`
+3. Bot replies: `Activated.`
+4. Moderation begins for ALLOWED_GROUP_ID.
+5. Admin adds banned words: `/orwell fraud,scam`
+6. Violations appear in /status aggregate counters.
+
+---
+
+## 🔄 Daily Salt Rotation (if no SALT provided)
+- Background task checks hourly.
+- When >24h elapsed:
+  - Generates new 32-byte random hex salt.
+  - Clears `violations` + `dm_spam`.
+  - Logs rotation event.
+- /status shows next rotation ETA (UTC).
+
+---
+
+## 🚫 DM Spam Handling
+
+| Condition | Action |
+|-----------|--------|
+| Non-admin DM count > threshold (window) | Ban from group + Block user |
+| Admin DM | Never counted |
+| Feedback to spammer | None (silent) |
+
+State resets if silence > window days or salt rotation occurs.
+
+---
+
+## 🧩 File / Data Layout
+
+| Path | Purpose |
+|------|---------|
+| `bot.py` | Main logic |
+| `data/bot.enc.db` | Encrypted SQLCipher database |
+| `data/bot_session*` | Telethon session |
+| `data/bot.log` | Log output |
+
+---
+
+## 🛠 Maintenance & Operations
+
+Action | Command / Method
+-------|------------------
+Add banned words | `/orwell bad1,bad2`
+Check status | `/status` (admin DM)
+Rotate salt manually | Remove SALT env; restart after 24h to rotate automatically
+Update dependencies | Pin bump in requirements.txt
+View logs | `tail -f data/bot.log`
+
+---
+
+## 📊 Status Example (Admin DM)
+/status:
+```
+📊 Status
+- Activation: Active (since 2025-09-21T22:00:00.000000)
+- Allowed group: -1001234567890
+- Banned words: 24
+- Violations (last 7d messages flagged): 5
+- DM Spam total (window): 3 | Actioned: 1
+- Salt mode: Rotating (24h)
+- Next rotation (UTC): 2025-09-22T22:00:00
+- Hash function: keyed blake2b/256
+- Substring scan: ENABLED
+```
+
+---
+
+## ❓ FAQ
+
+Q: Why are violation counts “reset”?  
+A: Rotating salt mode intentionally resets identity correlation daily (privacy boundary).
+
+Q: Can I disable rotation?  
+A: Set `SALT` explicitly – rotation stops.
+
+Q: Why not show top violators?  
+A: Design choice: minimize behavioral fingerprinting exposure.
+
+Q: False positives from substring?  
+A: You can modify detection to remove substring loop if precision required.
+
+---
+
+## 🔍 Future (Optional Enhancements – NOT Implemented)
+- Toggle for substring detection
+- Export/import banned words
+- Adaptive mute durations
+- Hash versioning for seamless rotations
+- Message pattern heuristics / ML scoring
+
+(Left out intentionally per scope.)
+
+---
+
+## ⚠ Disclaimer
+This bot enforces moderation logic; always verify environment configuration in restricted staging before production deployment. Encryption security depends on protecting `DB_PASSPHRASE`.
+
+---
+
+## 🧾 License
+Add your license text here (e.g. MIT).
+
+---
+
+Built for precision, privacy, and resilience.  
+Built with heart and Linux by AndroDoge
