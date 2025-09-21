@@ -1,5 +1,6 @@
 # Environment variables
 .env
+.env.*
 
 # Python
 __pycache__/
@@ -38,6 +39,7 @@ data/
 # Telethon session files
 *.session
 *.session-journal
+bot_session*
 
 # Logs
 *.log
