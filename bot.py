@@ -123,29 +123,10 @@ class DatabaseManager:
                 )
             ''')
             
-            # Global bans table
+            # Banned words table for dynamic management
             cursor.execute('''
-                CREATE TABLE IF NOT EXISTS global_bans (
-                    user_hash TEXT PRIMARY KEY,
-                    banned_at TIMESTAMP,
-                    reason TEXT
-                )
-            ''')
-            
-            # Forward state table
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS forward_state (
-                    user_hash TEXT PRIMARY KEY,
-                    last_forward TIMESTAMP
-                )
-            ''')
-            
-            # Cleanup state table
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS cleanup_state (
-                    group_id TEXT PRIMARY KEY,
-                    last_cleanup TIMESTAMP,
-                    last_offset INTEGER DEFAULT 0
+                CREATE TABLE IF NOT EXISTS banned_words (
+                    word TEXT PRIMARY KEY
                 )
             ''')
             
@@ -161,81 +142,76 @@ class DatabaseManager:
             return result[0] if result else 0
     
     def add_violation(self, user_id: int) -> int:
-        """Add violation for user and return new count"""
+        """Add violation for user and return new count, with 7-day reset logic"""
         user_hash = self.hash_user_id(user_id)
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
+            
+            # Get current violation data
+            cursor.execute('''
+                SELECT count, last_violation FROM violations WHERE user_hash = ?
+            ''', (user_hash,))
+            result = cursor.fetchone()
+            
+            current_count = 0
+            if result:
+                current_count = result[0]
+                last_violation = datetime.fromisoformat(result[1]) if result[1] else None
+                
+                # Reset count if more than 7 days have passed since last violation
+                if last_violation and (datetime.now() - last_violation).days > 7:
+                    current_count = 0
+            
+            new_count = current_count + 1
+            
             cursor.execute('''
                 INSERT OR REPLACE INTO violations (user_hash, count, last_violation)
-                VALUES (?, COALESCE((SELECT count FROM violations WHERE user_hash = ?), 0) + 1, ?)
-            ''', (user_hash, user_hash, datetime.now()))
-            conn.commit()
-            return self.get_user_violations(user_id)
-    
-    def is_globally_banned(self, user_id: int) -> bool:
-        """Check if user is globally banned"""
-        user_hash = self.hash_user_id(user_id)
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT 1 FROM global_bans WHERE user_hash = ?', (user_hash,))
-            return cursor.fetchone() is not None
-    
-    def add_global_ban(self, user_id: int, reason: str = "Multiple violations"):
-        """Add user to global ban list"""
-        user_hash = self.hash_user_id(user_id)
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT OR REPLACE INTO global_bans (user_hash, banned_at, reason)
                 VALUES (?, ?, ?)
-            ''', (user_hash, datetime.now(), reason))
+            ''', (user_hash, new_count, datetime.now()))
             conn.commit()
+            return new_count
     
-    def can_forward(self, user_id: int) -> bool:
-        """Check if user can forward (24h cooldown)"""
-        user_hash = self.hash_user_id(user_id)
+    def get_banned_words(self) -> set:
+        """Get all banned words from database"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute('SELECT last_forward FROM forward_state WHERE user_hash = ?', (user_hash,))
-            result = cursor.fetchone()
-            if not result:
+            cursor.execute('SELECT word FROM banned_words')
+            return {row[0] for row in cursor.fetchall()}
+    
+    def add_banned_word(self, word: str) -> bool:
+        """Add a banned word to database, returns True if added, False if already exists"""
+        word = word.strip().lower()
+        if not word:
+            return False
+        
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute('INSERT INTO banned_words (word) VALUES (?)', (word,))
+                conn.commit()
                 return True
-            
-            last_forward = datetime.fromisoformat(result[0])
-            return datetime.now() - last_forward >= timedelta(hours=24)
+            except sqlite3.IntegrityError:
+                return False  # Word already exists
     
-    def update_forward_time(self, user_id: int):
-        """Update last forward time for user"""
-        user_hash = self.hash_user_id(user_id)
+    def remove_banned_word(self, word: str) -> bool:
+        """Remove a banned word from database, returns True if removed, False if not found"""
+        word = word.strip().lower()
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute('''
-                INSERT OR REPLACE INTO forward_state (user_hash, last_forward)
-                VALUES (?, ?)
-            ''', (user_hash, datetime.now()))
+            cursor.execute('DELETE FROM banned_words WHERE word = ?', (word,))
+            conn.commit()
+            return cursor.rowcount > 0
+    
+    def load_initial_banned_words(self, words: set):
+        """Load initial banned words from environment into database"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            for word in words:
+                if word:  # Skip empty words
+                    cursor.execute('INSERT OR IGNORE INTO banned_words (word) VALUES (?)', (word,))
             conn.commit()
     
-    def get_cleanup_state(self, group_id: int) -> tuple:
-        """Get cleanup state for group"""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT last_cleanup, last_offset FROM cleanup_state WHERE group_id = ?', (str(group_id),))
-            result = cursor.fetchone()
-            if not result:
-                return None, 0
-            
-            last_cleanup = datetime.fromisoformat(result[0]) if result[0] else None
-            return last_cleanup, result[1]
-    
-    def update_cleanup_state(self, group_id: int, offset: int):
-        """Update cleanup state for group"""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT OR REPLACE INTO cleanup_state (group_id, last_cleanup, last_offset)
-                VALUES (?, ?, ?)
-            ''', (str(group_id), datetime.now(), offset))
-            conn.commit()
+
 
 class TelegramAdminBot:
     def __init__(self):
@@ -245,23 +221,6 @@ class TelegramAdminBot:
         self.bot_token = os.getenv('BOT_TOKEN')
         self.salt = os.getenv('SALT')
         
-        # Banned words from environment
-        banned_words_str = os.getenv('BANNED_WORDS', '')
-        self.banned_words = set(word.strip().lower() for word in banned_words_str.split(',') if word.strip())
-        
-        # Manual forward group IDs from environment
-        forward_group_ids_str = os.getenv('FORWARD_GROUP_IDS', '')
-        self.manual_forward_groups = []
-        if forward_group_ids_str.strip():
-            try:
-                # Parse comma-separated list of integers
-                group_ids = [int(gid.strip()) for gid in forward_group_ids_str.split(',') if gid.strip()]
-                self.manual_forward_groups = group_ids
-                logger.info(f"Loaded {len(self.manual_forward_groups)} forward group IDs from env (manual mode)")
-            except ValueError as e:
-                logger.error(f"Invalid FORWARD_GROUP_IDS format: {e}. Using auto-discovery instead.")
-                self.manual_forward_groups = []
-        
         # Validate required environment variables
         if not all([self.api_id, self.api_hash, self.bot_token, self.salt]):
             raise ValueError("Missing required environment variables: API_ID, API_HASH, BOT_TOKEN, SALT")
@@ -270,15 +229,23 @@ class TelegramAdminBot:
         db_path = DATA_DIR / "bot.db"
         self.db = DatabaseManager(db_path, self.salt)
         
+        # Load banned words from environment and database
+        banned_words_str = os.getenv('BANNED_WORDS', '')
+        env_banned_words = set(word.strip().lower() for word in banned_words_str.split(',') if word.strip())
+        
+        # Load initial banned words into database if any exist in environment
+        if env_banned_words:
+            self.db.load_initial_banned_words(env_banned_words)
+        
+        # Get all banned words from database (includes env words + any persisted ones)
+        self.banned_words = self.db.get_banned_words()
+        
         # Initialize rate limiter
         self.rate_limiter = TokenBucket(capacity=10, refill_rate=2.0)
         
         # Initialize Telethon client with data directory
         session_path = DATA_DIR / "bot_session"
         self.client = TelegramClient(str(session_path), int(self.api_id), self.api_hash)
-        
-        # Track groups for forwarding (max 20)
-        self.forward_groups: List[int] = []
         
         logger.info("Bot initialized successfully")
     
@@ -287,46 +254,13 @@ class TelegramAdminBot:
         await self.client.start(bot_token=self.bot_token)
         logger.info("Bot started successfully")
         
-        # Setup forwarding groups (manual or auto-discovery)
-        await self.discover_forward_groups()
-        
         # Register event handlers
         self.client.add_event_handler(self.handle_new_member, events.ChatAction)
         self.client.add_event_handler(self.handle_message, events.NewMessage)
         
-        # Schedule maintenance tasks
-        asyncio.create_task(self.maintenance_loop())
-        
         logger.info("Event handlers registered, bot is running...")
     
-    async def discover_forward_groups(self):
-        """Setup groups for forwarding (manual or auto-discovery)"""
-        # Use manual group IDs if provided
-        if self.manual_forward_groups:
-            self.forward_groups = self.manual_forward_groups.copy()
-            logger.info(f"Using manual forward groups: {len(self.forward_groups)} groups configured")
-            logger.info("Skipping auto-discovery because FORWARD_GROUP_IDS provided")
-            return
-        
-        # Fallback to auto-discovery with best-effort error handling
-        logger.info("FORWARD_GROUP_IDS not provided, attempting auto-discovery as fallback")
-        self.forward_groups = []
-        try:
-            async for dialog in self.client.iter_dialogs():
-                if (dialog.is_group or dialog.is_channel) and len(self.forward_groups) < 20:
-                    try:
-                        # Check if bot has permissions to send messages
-                        await self.client.get_permissions(dialog.id, 'me')
-                        self.forward_groups.append(dialog.id)
-                    except Exception:
-                        # Skip groups where bot doesn't have permissions
-                        continue
-            
-            logger.info(f"Auto-discovered {len(self.forward_groups)} groups for forwarding")
-        except Exception as e:
-            logger.error(f"Error in auto-discovery (non-fatal): {e}")
-            logger.info("Bot will continue without forwarding groups")
-    
+
     async def handle_new_member(self, event):
         """Handle new members joining the group"""
         try:
@@ -386,11 +320,6 @@ class TelegramAdminBot:
             else:
                 return
             
-            # Check if user is globally banned
-            if self.db.is_globally_banned(user_id):
-                await self.rate_limited_ban_user(event.chat_id, user_id)
-                return
-            
             message_text = event.message.text
             
             if not message_text:
@@ -405,7 +334,14 @@ class TelegramAdminBot:
                     logger.error(f"Error responding to /id command: {e}")
                     return
             
-            # Check for banned words
+            # Handle /orwell command for admins (DM only)
+            if event.is_private and message_text.strip().lower().startswith('/orwell'):
+                await self.handle_orwell_command(event, message_text)
+                return
+            
+            # Check for banned words (refresh banned words from database)
+            self.banned_words = self.db.get_banned_words()
+            
             if self.contains_banned_words(message_text):
                 logger.info(f"Banned word detected in message from user {user_id}")
                 
@@ -415,68 +351,131 @@ class TelegramAdminBot:
                 # Track violations in database
                 violation_count = self.db.add_violation(user_id)
                 
-                if violation_count >= 2:
-                    # Second violation - global ban
-                    logger.info(f"Globally banning user {user_id} for repeated banned word usage")
-                    self.db.add_global_ban(user_id, "Multiple banned word violations")
-                    await self.propagate_global_ban(user_id)
-                else:
-                    # First violation - just delete message
-                    logger.info(f"First violation for user {user_id} - message deleted")
-            else:
-                # Forward message if conditions are met
-                await self.handle_message_forwarding(event, user_id, message_text)
+                if violation_count == 1:
+                    # First violation - delete + 12h mute + ephemeral warning
+                    logger.info(f"First violation for user {user_id} - deleting message, applying 12h mute, sending warning")
+                    
+                    # Apply 12-hour mute
+                    await self.mute_user(event.chat_id, user_id, hours=12)
+                    
+                    # Send ephemeral warning (reply that will be auto-deleted)
+                    try:
+                        warning_msg = await event.respond(
+                            f"⚠️ Warning: Your message contained banned content and has been deleted. "
+                            f"You have been muted for 12 hours. A second violation within 7 days will result in a ban.",
+                            reply_to=event.message.id
+                        )
+                        # Delete warning after 30 seconds
+                        asyncio.create_task(self.delete_after_delay(warning_msg, 30))
+                    except Exception as e:
+                        logger.error(f"Error sending warning message: {e}")
+                        
+                elif violation_count >= 2:
+                    # Second+ violation within 7 days - ban
+                    logger.info(f"Second violation for user {user_id} within 7 days - banning user")
+                    await self.ban_user(event.chat_id, user_id)
                     
         except Exception as e:
             logger.error(f"Error in handle_message: {e}")
     
-    async def handle_message_forwarding(self, event, user_id: int, message_text: str):
-        """Handle message forwarding logic"""
+    async def handle_orwell_command(self, event, message_text: str):
+        """Handle /orwell command for managing banned words"""
         try:
-            # Only forward plain text messages (no media)
-            if not message_text or event.message.media:
+            parts = message_text.strip().split()
+            if len(parts) < 2:
+                await event.reply(
+                    "📝 **Banned Words Management**\n\n"
+                    "Commands:\n"
+                    "• `/orwell list` - Show all banned words\n"
+                    "• `/orwell add <word>` - Add a banned word\n"
+                    "• `/orwell remove <word>` - Remove a banned word\n"
+                    "• `/orwell count` - Show number of banned words"
+                )
                 return
             
-            # Check if user can forward (24h cooldown)
-            if not self.db.can_forward(user_id):
-                return
+            command = parts[1].lower()
             
-            # Skip if message contains banned words
-            if self.contains_banned_words(message_text):
-                return
+            if command == "list":
+                banned_words = self.db.get_banned_words()
+                if banned_words:
+                    words_list = sorted(banned_words)
+                    # Split into chunks to avoid message length limits
+                    chunk_size = 50
+                    for i in range(0, len(words_list), chunk_size):
+                        chunk = words_list[i:i+chunk_size]
+                        await event.reply(f"🚫 **Banned Words ({i+1}-{min(i+chunk_size, len(words_list))} of {len(words_list)}):**\n\n" + ", ".join(chunk))
+                else:
+                    await event.reply("📝 No banned words configured.")
             
-            # Forward to all available groups (up to 20)
-            forwarded_count = 0
-            for group_id in self.forward_groups:
-                if group_id == event.chat_id:
-                    continue  # Don't forward to the same group
+            elif command == "add":
+                if len(parts) < 3:
+                    await event.reply("❌ Usage: `/orwell add <word>`")
+                    return
                 
-                try:
-                    await self.rate_limiter.wait_for_token()
-                    await self.client.send_message(group_id, message_text)
-                    forwarded_count += 1
-                    await asyncio.sleep(0.5)  # Additional rate limiting
-                except Exception as e:
-                    logger.error(f"Error forwarding to group {group_id}: {e}")
+                word = parts[2].strip().lower()
+                if self.db.add_banned_word(word):
+                    # Refresh the bot's banned words cache
+                    self.banned_words = self.db.get_banned_words()
+                    await event.reply(f"✅ Added banned word: `{word}`")
+                else:
+                    await event.reply(f"⚠️ Word `{word}` is already banned.")
             
-            if forwarded_count > 0:
-                logger.info(f"Forwarded message from user {user_id} to {forwarded_count} groups")
-                self.db.update_forward_time(user_id)
+            elif command == "remove":
+                if len(parts) < 3:
+                    await event.reply("❌ Usage: `/orwell remove <word>`")
+                    return
+                
+                word = parts[2].strip().lower()
+                if self.db.remove_banned_word(word):
+                    # Refresh the bot's banned words cache
+                    self.banned_words = self.db.get_banned_words()
+                    await event.reply(f"✅ Removed banned word: `{word}`")
+                else:
+                    await event.reply(f"⚠️ Word `{word}` is not in the banned list.")
+            
+            elif command == "count":
+                count = len(self.db.get_banned_words())
+                await event.reply(f"📊 Total banned words: {count}")
+            
+            else:
+                await event.reply("❌ Unknown command. Use `/orwell` for help.")
         
         except Exception as e:
-            logger.error(f"Error in message forwarding: {e}")
+            logger.error(f"Error in handle_orwell_command: {e}")
+            await event.reply("❌ An error occurred while processing the command.")
+
+    async def mute_user(self, chat_id: int, user_id: int, hours: int = 12):
+        """Mute a user for specified hours"""
+        try:
+            mute_until = datetime.now() + timedelta(hours=hours)
+            ban_rights = ChatBannedRights(
+                until_date=mute_until,
+                send_messages=True,
+                send_media=True,
+                send_stickers=True,
+                send_gifs=True,
+                send_games=True,
+                send_inline=True,
+                embed_links=True
+            )
+            await self.client.edit_permissions(chat_id, user_id, ban_rights)
+            
+        except (ChatAdminRequiredError, UserAdminInvalidError):
+            logger.error(f"Bot lacks admin permissions to mute user {user_id}")
+        except FloodWaitError as e:
+            logger.warning(f"Flood wait error, waiting {e.seconds} seconds")
+            await asyncio.sleep(e.seconds)
+        except Exception as e:
+            logger.error(f"Error muting user {user_id}: {e}")
+
+    async def delete_after_delay(self, message, delay_seconds: int):
+        """Delete a message after specified delay"""
+        try:
+            await asyncio.sleep(delay_seconds)
+            await message.delete()
+        except Exception as e:
+            logger.error(f"Error deleting delayed message: {e}")
     
-    async def propagate_global_ban(self, user_id: int):
-        """Propagate global ban to all groups"""
-        banned_count = 0
-        for group_id in self.forward_groups:
-            try:
-                await self.rate_limited_ban_user(group_id, user_id)
-                banned_count += 1
-            except Exception as e:
-                logger.error(f"Error banning user {user_id} in group {group_id}: {e}")
-        
-        logger.info(f"Propagated global ban for user {user_id} to {banned_count} groups")
     
     def contains_banned_words(self, text: str) -> bool:
         """Check if text contains any banned words"""
@@ -520,11 +519,7 @@ class TelegramAdminBot:
         except Exception as e:
             logger.error(f"Error kicking user {user_id}: {e}")
 
-    async def rate_limited_ban_user(self, chat_id: int, user_id: int):
-        """Ban a user with rate limiting"""
-        await self.rate_limiter.wait_for_token()
-        await self.ban_user(chat_id, user_id)
-    
+
     async def ban_user(self, chat_id: int, user_id: int):
         """Ban a user from the group permanently"""
         try:
@@ -549,68 +544,7 @@ class TelegramAdminBot:
         except Exception as e:
             logger.error(f"Error banning user {user_id}: {e}")
     
-    async def cleanup_deleted_accounts(self, chat_id: int):
-        """Remove deleted accounts from the group with pagination"""
-        try:
-            last_cleanup, offset = self.db.get_cleanup_state(chat_id)
-            
-            # Get participants with pagination (25 per run)
-            participants = await self.client.get_participants(
-                chat_id, 
-                limit=25, 
-                offset=offset
-            )
-            
-            deleted_count = 0
-            for participant in participants:
-                # Check if user is deleted by checking if user.deleted attribute exists and is True
-                if hasattr(participant, 'deleted') and participant.deleted:
-                    try:
-                        logger.info(f"Removing deleted account: {participant.id}")
-                        await self.rate_limiter.wait_for_token()
-                        await self.kick_user(chat_id, participant.id)
-                        deleted_count += 1
-                        await asyncio.sleep(1)  # Additional rate limiting
-                    except Exception as e:
-                        logger.error(f"Error removing deleted account {participant.id}: {e}")
-            
-            # Update cleanup state
-            new_offset = offset + len(participants) if len(participants) == 25 else 0
-            self.db.update_cleanup_state(chat_id, new_offset)
-            
-            if deleted_count > 0:
-                logger.info(f"Cleaned up {deleted_count} deleted accounts from group {chat_id}")
-                        
-        except Exception as e:
-            logger.error(f"Error in cleanup_deleted_accounts: {e}")
-    
-    async def maintenance_loop(self):
-        """Run maintenance tasks (cleanup every 12 hours)"""
-        while True:
-            try:
-                # Wait 12 hours
-                await asyncio.sleep(12 * 3600)
-                
-                logger.info("Starting maintenance loop")
-                
-                # Clean up all groups the bot is in (one group per run, rotating)
-                if self.forward_groups:
-                    # Rotate through groups, one group per maintenance cycle
-                    group_count = len(self.forward_groups)
-                    if group_count > 0:
-                        # Get current time to determine which group to clean
-                        current_time = int(time.time())
-                        group_index = (current_time // (12 * 3600)) % group_count
-                        group_to_clean = self.forward_groups[group_index]
-                        
-                        logger.info(f"Cleaning group {group_to_clean} (index {group_index})")
-                        await self.cleanup_deleted_accounts(group_to_clean)
-                
-                logger.info("Maintenance loop completed")
-                                
-            except Exception as e:
-                logger.error(f"Error in maintenance_loop: {e}")
-    
+
     async def run(self):
         """Run the bot indefinitely"""
         await self.start()

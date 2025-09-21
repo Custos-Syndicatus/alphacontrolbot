@@ -8,10 +8,11 @@ Automates moderation, forwarding, bans, and more — fast, secure, and easy to s
 ## ✨ Features
 
 - 🔐 **Username Check**: Auto-kicks new members without @username
-- 🚫 **Content Moderation**: Deletes messages with banned words, bans repeat offenders
-- 🌐 **Global Ban**: Bans propagate to all managed groups
-- 📡 **Message Forwarding**: Forwards plain text to up to 20 groups, with per-user 24h cooldown
-- 🧹 **Automatic Cleanups**: Periodically removes deleted accounts from groups
+- 🚫 **Content Moderation**: Deletes messages with banned words
+  - First violation: Delete message + 12h mute + ephemeral warning
+  - Second violation within 7 days: Permanent ban
+  - Automatic reset after 7+ days
+- 📝 **Dynamic Banned Words**: Manage banned words via `/orwell` command in DMs
 - ⚡ **Performance & Security**: Rate limiting, secure user tracking, persistent SQLite storage
 
 ---
@@ -84,13 +85,21 @@ Automates moderation, forwarding, bans, and more — fast, secure, and easy to s
 
 ## 📝 Usage
 
-1. **Add bot to your groups**
-2. **Make bot admin** (delete messages, ban users, view members, etc)
+1. **Add bot to your group**
+2. **Make bot admin** (delete messages, ban/mute users, view members, etc)
 3. **Bot works automatically!**
    - Checks new members for usernames
-   - Moderates messages
-   - Forwards plain text
-   - Cleans up deleted accounts
+   - Moderates messages with progressive enforcement
+   - First violation: Delete + 12h mute + warning
+   - Second violation within 7 days: Ban
+
+## 🔧 Managing Banned Words
+
+Send the bot a DM with `/orwell` commands:
+- `/orwell list` - Show all banned words
+- `/orwell add <word>` - Add a banned word
+- `/orwell remove <word>` - Remove a banned word
+- `/orwell count` - Show number of banned words
 
 ---
 
@@ -104,9 +113,9 @@ Automates moderation, forwarding, bans, and more — fast, secure, and easy to s
 
 ## 💡 Tips
 
-- Banned words are set via `.env`
-- Bot manages up to 20 groups for forwarding
-- Forwarding respects per-user cooldowns
+- Banned words can be set via `.env` file and managed dynamically via `/orwell` DMs
+- Bot focuses on single-group moderation with progressive enforcement
+- Violations reset automatically after 7 days
 
 ---
 

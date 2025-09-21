@@ -53,20 +53,14 @@ def test_database_operations():
         count2 = db.add_violation(user_id)
         assert count2 == 2, "Second violation should return 2"
         
-        # Test global ban
-        db.add_global_ban(user_id)
-        assert db.is_globally_banned(user_id), "User should be globally banned"
+        # Test banned words management
+        assert db.add_banned_word("testword"), "Should add banned word"
+        banned_words = db.get_banned_words()
+        assert "testword" in banned_words, "Should contain added word"
         
-        # Test forward cooldown
-        assert db.can_forward(user_id), "User should initially be able to forward"
-        db.update_forward_time(user_id)
-        assert not db.can_forward(user_id), "User should not be able to forward after update"
-        
-        # Test cleanup state
-        group_id = 67890
-        db.update_cleanup_state(group_id, 25)
-        last_cleanup, offset = db.get_cleanup_state(group_id)
-        assert offset == 25, "Cleanup offset should be 25"
+        assert db.remove_banned_word("testword"), "Should remove banned word"
+        banned_words = db.get_banned_words()
+        assert "testword" not in banned_words, "Should not contain removed word"
         
         print("   ✅ Database operations working")
         
