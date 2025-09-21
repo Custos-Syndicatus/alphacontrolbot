@@ -1,71 +1,87 @@
 #!/usr/bin/env python3
 """
-Telegram Admin Bot - XController (Enhanced)
+XController Telegram Admin Bot (Secure Enhanced Edition)
 
-Features:
-1. Auto-kick new members without username (only after activation)
-2. Filter banned words from messages (only after activation)
-3. Clean up / moderate (progressive enforcement: delete+mute -> ban)
-4. Admin-only DM control (ONLY UIDs in ADMIN_USER_IDS; bot replies to nobody else)
-5. Activation gate: bot does nothing in groups until an admin DM's 'activate'
-6. /orwell multi-add: /orwell word OR /orwell word1,word2,word3
-7. Auto-generate volatile SALT if absent (hash instability warning)
+Features (approved set):
+- Activation gate (admin DM 'activate')
+- Single allowed group enforcement (ALLOWED_GROUP_ID)
+- Uniform moderation for normal, forwarded and edited messages
+- Immediate deletion of messages containing banned words
+- Progressive penalties (delete + 12h mute -> permanent ban within 7d window)
+- Username requirement on join (kick if missing) after activation
+- Admin-only DM control (/orwell multi-add, /status, activate)
+- Multi-add banned words: /orwell word1,word2,word3
+- Daily rotating keyed BLAKE2b hashing salt (if SALT env missing) persisted & auto-rotated
+- Encrypted SQLite (SQLCipher) storage (violations, banned_words, activation, dm_spam, salt_state)
+- DM spam suppression: non-admin DM > threshold (50 default in 7d) → silent group ban + block
+- Status summary without exposing hashed identities
+- Substring + word-boundary banned-word detection (substring kept ON, documented)
+
+Security design:
+- If SALT provided: fixed mode (no rotation)
+- If SALT not provided: secure random 32-byte hex salt rotated every 24h (violations & dm_spam reset)
+- Keyed BLAKE2b (digest_size=32) for user_id anonymization
+- SQLCipher encryption with passphrase DB_PASSPHRASE
 """
 
 import os
 import re
 import logging
 import asyncio
-import sqlite3
-import hashlib
-import hmac
 import time
 import secrets
-from typing import Set, List, Tuple
+import sqlite3  # Will be overridden by pysqlcipher3 import below
+from typing import Set, List, Tuple, Dict, Optional
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from telethon import TelegramClient, events
-from telethon.tl.types import (
-    ChatBannedRights,
-)
+# SQLCipher driver
+try:
+    import pysqlcipher3.dbapi2 as sqlcipher
+except ImportError as e:
+    raise ImportError(
+        "pysqlcipher3 is required. Install system dependencies (e.g. apt install sqlcipher libsqlcipher-dev) "
+        "then pip install pysqlcipher3."
+    ) from e
+
+from telethon import TelegramClient, events, functions
+from telethon.tl.types import ChatBannedRights
 from telethon.errors import (
     ChatAdminRequiredError,
     UserAdminInvalidError,
     FloodWaitError
 )
 from dotenv import load_dotenv
+from hashlib import blake2b
 
-# Load environment variables
 load_dotenv()
 
-# ----------------------------
-# Data directory resolution
-# ----------------------------
+# -----------------------------
+# Data directory
+# -----------------------------
 def get_data_dir() -> Path:
-    """Get data directory with fallback logic"""
     data_dir = Path("/data")
     if data_dir.exists() and data_dir.is_dir():
         try:
-            test_file = data_dir / ".write_test"
-            test_file.touch()
-            test_file.unlink()
+            tmp = data_dir / ".write_test"
+            tmp.touch()
+            tmp.unlink()
             return data_dir
         except (PermissionError, OSError):
             pass
-    fallback_dir = Path("./data")
-    fallback_dir.mkdir(exist_ok=True)
-    return fallback_dir
+    fallback = Path("./data")
+    fallback.mkdir(exist_ok=True)
+    return fallback
 
 DATA_DIR = get_data_dir()
 
-# ----------------------------
+# -----------------------------
 # Logging
-# ----------------------------
+# -----------------------------
 log_file = DATA_DIR / "bot.log"
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
         logging.FileHandler(log_file),
         logging.StreamHandler()
@@ -74,11 +90,10 @@ logging.basicConfig(
 logger = logging.getLogger("xcontroller")
 logger.info(f"Using data directory: {DATA_DIR}")
 
-# ----------------------------
-# Rate limiting
-# ----------------------------
+# -----------------------------
+# Rate limiting (placeholder)
+# -----------------------------
 class TokenBucket:
-    """Token bucket implementation for rate limiting"""
     def __init__(self, capacity: int = 10, refill_rate: float = 2.0):
         self.capacity = capacity
         self.tokens = capacity
@@ -87,125 +102,204 @@ class TokenBucket:
 
     async def consume(self, tokens: int = 1) -> bool:
         now = time.time()
-        time_passed = now - self.last_refill
-        self.tokens = min(self.capacity, self.tokens + (time_passed * self.refill_rate))
+        elapsed = now - self.last_refill
+        self.tokens = min(self.capacity, self.tokens + elapsed * self.refill_rate)
         self.last_refill = now
         if self.tokens >= tokens:
             self.tokens -= tokens
             return True
         return False
 
-    async def wait_for_token(self):
-        while not await self.consume():
-            await asyncio.sleep(0.1)
-
-# ----------------------------
-# Database Manager
-# ----------------------------
+# -----------------------------
+# Database Manager (SQLCipher)
+# -----------------------------
 class DatabaseManager:
-    """Manage SQLite database operations & activation state"""
-    def __init__(self, db_path: Path, salt: str):
+    """
+    Manages encrypted SQLite (SQLCipher) + salted hashing state.
+    Tables:
+      - activation_state(id=1, activated INT, activated_at TEXT)
+      - banned_words(word TEXT PK)
+      - violations(user_hash PK, count INT, last_violation TEXT)
+      - dm_spam(user_hash PK, count INT, last_seen TEXT, actioned INT)
+      - salt_state(id=1, salt TEXT, last_rotated_at TEXT)   (only if SALT not provided)
+    """
+    def __init__(self, db_path: Path, db_passphrase: str, initial_salt: Optional[str], rotation_enabled: bool):
         self.db_path = db_path
-        self.salt = salt.encode()
-        self.init_database()
+        self.db_passphrase = db_passphrase
+        self.rotation_enabled = rotation_enabled  # True if SALT not provided (enable daily rotation)
+        self.current_salt = initial_salt  # hex string
+        self._init_and_load()
 
     def _connect(self):
-        return sqlite3.connect(self.db_path)
+        conn = sqlcipher.connect(self.db_path)
+        # Apply key
+        conn.execute(f"PRAGMA key='{self.db_passphrase}';")
+        # Optional cipher settings (can adjust page_size/kdf_iter)
+        conn.execute("PRAGMA cipher_page_size = 4096;")
+        conn.execute("PRAGMA kdf_iter = 64000;")
+        conn.execute("PRAGMA cipher_hmac_algorithm = HMAC_SHA512;")
+        conn.execute("PRAGMA cipher_kdf_algorithm = PBKDF2_HMAC_SHA512;")
+        return conn
 
-    def hash_user_id(self, user_id: int) -> str:
-        return hmac.new(self.salt, str(user_id).encode(), hashlib.sha256).hexdigest()
-
-    def init_database(self):
+    def _init_and_load(self):
         with self._connect() as conn:
             cur = conn.cursor()
-            # Violations
+            # Core tables
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS violations (
-                    user_hash TEXT PRIMARY KEY,
-                    count INTEGER DEFAULT 0,
-                    last_violation TIMESTAMP
-                )
-            """)
-            # Banned words
+            CREATE TABLE IF NOT EXISTS activation_state(
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                activated INTEGER NOT NULL,
+                activated_at TEXT NOT NULL
+            )""")
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS banned_words (
-                    word TEXT PRIMARY KEY
-                )
-            """)
-            # Activation state
+            CREATE TABLE IF NOT EXISTS banned_words(
+                word TEXT PRIMARY KEY
+            )""")
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS activation_state (
-                    id INTEGER PRIMARY KEY CHECK (id=1),
-                    activated INTEGER NOT NULL,
-                    activated_at TIMESTAMP NOT NULL
-                )
-            """)
-            # Ensure single row
+            CREATE TABLE IF NOT EXISTS violations(
+                user_hash TEXT PRIMARY KEY,
+                count INTEGER DEFAULT 0,
+                last_violation TEXT
+            )""")
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS dm_spam(
+                user_hash TEXT PRIMARY KEY,
+                count INTEGER DEFAULT 0,
+                last_seen TEXT,
+                actioned INTEGER DEFAULT 0
+            )""")
+            # Salt state only needed if rotation enabled
+            if self.rotation_enabled:
+                cur.execute("""
+                CREATE TABLE IF NOT EXISTS salt_state(
+                    id INTEGER PRIMARY KEY CHECK(id=1),
+                    salt TEXT NOT NULL,
+                    last_rotated_at TEXT NOT NULL
+                )""")
+                cur.execute("SELECT salt, last_rotated_at FROM salt_state WHERE id=1")
+                row = cur.fetchone()
+                if row is None:
+                    # create new salt
+                    gen = secrets.token_hex(32)
+                    now = datetime.utcnow().isoformat()
+                    cur.execute("INSERT INTO salt_state(id, salt, last_rotated_at) VALUES (1, ?, ?)",
+                                (gen, now))
+                    self.current_salt = gen
+                    logger.info("Initialized rotating salt (first generation).")
+                else:
+                    self.current_salt = row[0]
+            else:
+                # activation row if missing
+                pass
+
             cur.execute("SELECT activated FROM activation_state WHERE id=1")
             if cur.fetchone() is None:
-                cur.execute(
-                    "INSERT INTO activation_state (id, activated, activated_at) VALUES (1, 0, ?)",
-                    (datetime.utcnow().isoformat(),)
-                )
+                cur.execute("INSERT INTO activation_state(id, activated, activated_at) VALUES (1, 0, ?)",
+                            (datetime.utcnow().isoformat(),))
             conn.commit()
 
-    # Activation helpers
+        if not self.current_salt:
+            # Edge case: rotation disabled but no SALT provided? Should not happen.
+            raise ValueError("Salt initialization failed (no SALT and rotation disabled).")
+
+    # -------- Salt rotation --------
+    def rotate_salt_if_due(self) -> bool:
+        """Rotate salt if rotation_enabled and >24h since last rotation. Returns True if rotated."""
+        if not self.rotation_enabled:
+            return False
+        with self._connect() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT salt, last_rotated_at FROM salt_state WHERE id=1")
+            row = cur.fetchone()
+            if not row:
+                return False
+            old_salt, last_rotated_at = row
+            last_dt = datetime.fromisoformat(last_rotated_at)
+            if datetime.utcnow() - last_dt > timedelta(days=1):
+                new_salt = secrets.token_hex(32)
+                cur.execute("UPDATE salt_state SET salt=?, last_rotated_at=? WHERE id=1",
+                            (new_salt, datetime.utcnow().isoformat()))
+                # Clear data tied to old salt (user_hash becomes obsolete)
+                cur.execute("DELETE FROM violations")
+                cur.execute("DELETE FROM dm_spam")
+                conn.commit()
+                self.current_salt = new_salt
+                logger.info("Rotated salt (daily) -> violations & dm_spam reset.")
+                return True
+        return False
+
+    def next_rotation_eta(self) -> Optional[str]:
+        if not self.rotation_enabled:
+            return None
+        with self._connect() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT last_rotated_at FROM salt_state WHERE id=1")
+            row = cur.fetchone()
+            if not row:
+                return None
+            last_dt = datetime.fromisoformat(row[0])
+            nxt = last_dt + timedelta(days=1)
+            return nxt.isoformat()
+
+    # -------- Hashing (keyed blake2b) --------
+    def hash_user_id(self, user_id: int) -> str:
+        # Keyed blake2b (digest_size=32)
+        h = blake2b(key=bytes.fromhex(self.current_salt), digest_size=32)
+        h.update(str(user_id).encode())
+        return h.hexdigest()
+
+    # -------- Activation --------
     def is_activated(self) -> bool:
         with self._connect() as conn:
             cur = conn.cursor()
             cur.execute("SELECT activated FROM activation_state WHERE id=1")
-            row = cur.fetchone()
-            return bool(row and row[0] == 1)
+            r = cur.fetchone()
+            return bool(r and r[0] == 1)
 
     def set_activated(self):
         with self._connect() as conn:
             cur = conn.cursor()
-            cur.execute(
-                "UPDATE activation_state SET activated=1, activated_at=? WHERE id=1",
-                (datetime.utcnow().isoformat(),)
-            )
+            cur.execute("UPDATE activation_state SET activated=1, activated_at=? WHERE id=1",
+                        (datetime.utcnow().isoformat(),))
             conn.commit()
 
-    # Violations
-    def get_user_violations(self, user_id: int) -> int:
-        user_hash = self.hash_user_id(user_id)
+    def get_activation_row(self) -> Tuple[int, str]:
         with self._connect() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT count FROM violations WHERE user_hash = ?", (user_hash,))
-            r = cur.fetchone()
-            return r[0] if r else 0
+            cur.execute("SELECT activated, activated_at FROM activation_state WHERE id=1")
+            return cur.fetchone()
 
+    # -------- Violations --------
     def add_violation(self, user_id: int) -> int:
         user_hash = self.hash_user_id(user_id)
+        now = datetime.utcnow()
         with self._connect() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT count, last_violation FROM violations WHERE user_hash = ?", (user_hash,))
+            cur.execute("SELECT count, last_violation FROM violations WHERE user_hash=?", (user_hash,))
             r = cur.fetchone()
-            current_count = 0
+            current = 0
             if r:
-                current_count = r[0]
-                last_violation = datetime.fromisoformat(r[1]) if r[1] else None
-                if last_violation and (datetime.now() - last_violation).days > 7:
-                    current_count = 0
-            new_count = current_count + 1
+                current = r[0]
+                last = datetime.fromisoformat(r[1]) if r[1] else None
+                if last and (now - last).days > 7:
+                    current = 0
+            new_count = current + 1
             cur.execute("""
-                INSERT OR REPLACE INTO violations (user_hash, count, last_violation)
+                INSERT OR REPLACE INTO violations(user_hash, count, last_violation)
                 VALUES (?, ?, ?)
-            """, (user_hash, new_count, datetime.now().isoformat()))
+            """, (user_hash, new_count, now.isoformat()))
             conn.commit()
             return new_count
 
-    # Banned words
+    # -------- Banned words --------
     def get_banned_words(self) -> Set[str]:
         with self._connect() as conn:
             cur = conn.cursor()
             cur.execute("SELECT word FROM banned_words")
-            return {row[0] for row in cur.fetchall()}
+            return {r[0] for r in cur.fetchall()}
 
     def add_banned_words(self, words: List[str]) -> Tuple[List[str], List[str]]:
-        added = []
-        existing = []
-        cleaned = []
+        added, existing, cleaned = [], [], []
         for w in words:
             w2 = w.strip().lower()
             if w2:
@@ -216,7 +310,7 @@ class DatabaseManager:
             cur = conn.cursor()
             for w in cleaned:
                 try:
-                    cur.execute("INSERT INTO banned_words (word) VALUES (?)", (w,))
+                    cur.execute("INSERT INTO banned_words(word) VALUES (?)", (w,))
                     added.append(w)
                     logger.info(f"Added banned word: {w}")
                 except sqlite3.IntegrityError:
@@ -231,51 +325,133 @@ class DatabaseManager:
         with self._connect() as conn:
             cur = conn.cursor()
             for w in words:
-                if w:
-                    cur.execute("INSERT OR IGNORE INTO banned_words (word) VALUES (?)", (w,))
+                cur.execute("INSERT OR IGNORE INTO banned_words(word) VALUES (?)", (w,))
             conn.commit()
 
-# ----------------------------
+    # -------- DM Spam --------
+    def record_dm(self, user_id: int, window_days: int) -> Tuple[int, bool]:
+        """
+        Returns (new_count, action_already_taken).
+        Resets count if last_seen older than window_days.
+        """
+        user_hash = self.hash_user_id(user_id)
+        now = datetime.utcnow()
+        with self._connect() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT count, last_seen, actioned FROM dm_spam WHERE user_hash=?", (user_hash,))
+            r = cur.fetchone()
+            count = 0
+            actioned = False
+            if r:
+                count, last_seen, actioned_flag = r
+                actioned = bool(actioned_flag)
+                if last_seen:
+                    last_dt = datetime.fromisoformat(last_seen)
+                    if (now - last_dt).days > window_days:
+                        count = 0
+            count += 1
+            cur.execute("""
+                INSERT OR REPLACE INTO dm_spam(user_hash, count, last_seen, actioned)
+                VALUES (?, ?, ?, ?)
+            """, (user_hash, count, now.isoformat(), 1 if actioned else 0))
+            conn.commit()
+            return count, actioned
+
+    def mark_dm_spam_actioned(self, user_id: int):
+        user_hash = self.hash_user_id(user_id)
+        with self._connect() as conn:
+            cur = conn.cursor()
+            cur.execute("UPDATE dm_spam SET actioned=1 WHERE user_hash=?", (user_hash,))
+            conn.commit()
+
+    # -------- Aggregates for status --------
+    def get_violation_aggregate(self) -> int:
+        now = datetime.utcnow()
+        cutoff = now - timedelta(days=7)
+        with self._connect() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM violations WHERE last_violation >= ?", (cutoff.isoformat(),))
+            return cur.fetchone()[0]
+
+    def get_dm_spam_aggregate(self, window_days: int) -> Dict[str, int]:
+        now = datetime.utcnow()
+        cutoff = now - timedelta(days=window_days)
+        with self._connect() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT COUNT(*) FROM dm_spam
+                WHERE last_seen >= ? AND actioned=1
+            """, (cutoff.isoformat(),))
+            actioned = cur.fetchone()[0]
+            cur.execute("""
+                SELECT COUNT(*) FROM dm_spam
+                WHERE last_seen >= ?
+            """, (cutoff.isoformat(),))
+            total = cur.fetchone()[0]
+        return {"actioned": actioned, "total": total}
+
+# -----------------------------
 # Telegram Bot
-# ----------------------------
+# -----------------------------
 class TelegramAdminBot:
     HELP_TEXT = (
         "/orwell <word OR word1,word2,word3>\n"
-        "activate  (send as plain DM if bot not active)\n\n"
-        "Only listed admin IDs receive responses. Other users are ignored."
+        "/status (admin only)\n"
+        "activate (if not active)\n\n"
+        "Only configured admin IDs receive responses. Others are ignored silently."
     )
 
     def __init__(self):
-        # Required envs
+        # Required core env
         self.api_id = os.getenv("API_ID")
         self.api_hash = os.getenv("API_HASH")
         self.bot_token = os.getenv("BOT_TOKEN")
-
         if not all([self.api_id, self.api_hash, self.bot_token]):
-            raise ValueError("Missing required env vars: API_ID, API_HASH, BOT_TOKEN")
+            raise ValueError("API_ID, API_HASH, BOT_TOKEN are required.")
 
-        # SALT (optional)
-        salt_env = os.getenv("SALT", "").strip()
-        if not salt_env:
-            salt_env = secrets.token_hex(32)
-            logger.warning("SALT not set; generated volatile SALT (hash stability lost across restarts)")
-        self.salt = salt_env
+        # Allowed single group
+        allowed_gid = os.getenv("ALLOWED_GROUP_ID")
+        if not allowed_gid or not allowed_gid.isdigit():
+            raise ValueError("ALLOWED_GROUP_ID must be set to the numeric Telegram group ID.")
+        self.allowed_group_id = int(allowed_gid)
+
+        # SALT config
+        provided_salt = os.getenv("SALT", "").strip()
+        rotation_enabled = False
+        if provided_salt:
+            current_salt = provided_salt
+            rotation_enabled = False
+            logger.info("Using fixed SALT from environment (no rotation).")
+        else:
+            current_salt = None  # Will be created by DB manager
+            rotation_enabled = True
+            logger.warning("No SALT provided: enabling daily rotating salt (violations reset on rotation).")
+
+        # DB encryption passphrase
+        db_passphrase = os.getenv("DB_PASSPHRASE", "").strip()
+        if not db_passphrase:
+            raise ValueError("DB_PASSPHRASE is required for SQLCipher encryption.")
+
+        db_path = DATA_DIR / "bot.enc.db"
+        self.db = DatabaseManager(
+            db_path=db_path,
+            db_passphrase=db_passphrase,
+            initial_salt=provided_salt or current_salt,
+            rotation_enabled=rotation_enabled
+        )
+
+        self.rotation_enabled = rotation_enabled
 
         # Admin IDs
         self.admin_ids = self._parse_admin_ids()
         if not self.admin_ids:
-            logger.warning("ADMIN_USER_IDS not set or empty. No one can control the bot.")
+            logger.warning("ADMIN_USER_IDS empty or missing. No one can control the bot.")
 
-        # DB
-        db_path = DATA_DIR / "bot.db"
-        self.db = DatabaseManager(db_path, self.salt)
+        # DM spam config
+        self.dm_spam_threshold = self._parse_int_env("DM_SPAM_THRESHOLD", 50, min_v=5, max_v=1000)
+        self.dm_spam_window_days = self._parse_int_env("DM_SPAM_WINDOW_DAYS", 7, min_v=1, max_v=30)
 
-        # Activation snapshot
-        self._active_cache = self.db.is_activated()
-        if not self._active_cache:
-            logger.info("Bot inactive: waiting for admin 'activate' DM")
-
-        # Initial banned words from env
+        # Load initial banned words (if any)
         env_words = set(
             w.strip().lower()
             for w in os.getenv("BANNED_WORDS", "").split(",")
@@ -283,197 +459,267 @@ class TelegramAdminBot:
         )
         if env_words:
             self.db.load_initial_banned_words(env_words)
-
         self.banned_words = self.db.get_banned_words()
 
-        # Telethon
+        self._active_cache = self.db.is_activated()
+        if not self._active_cache:
+            logger.info("Bot inactive: awaiting 'activate' admin DM.")
+
         session_path = DATA_DIR / "bot_session"
         self.client = TelegramClient(str(session_path), int(self.api_id), self.api_hash)
 
-        # Rate limiter (not heavily used yet)
         self.rate_limiter = TokenBucket(capacity=10, refill_rate=2.0)
 
-        logger.info("Bot initialized")
+        logger.info("Bot initialized with secure configuration.")
 
+    # ------------- Helpers -------------
     def _parse_admin_ids(self) -> Set[int]:
         raw = os.getenv("ADMIN_USER_IDS", "")
-        ids = set()
+        out = set()
         for part in raw.split(","):
             p = part.strip()
             if p.isdigit():
-                try:
-                    ids.add(int(p))
-                except ValueError:
-                    pass
-        return ids
+                out.add(int(p))
+        return out
+
+    def _parse_int_env(self, name: str, default: int, min_v: int, max_v: int) -> int:
+        val_raw = os.getenv(name, str(default)).strip()
+        if not val_raw.isdigit():
+            logger.warning(f"{name} invalid; using default {default}")
+            return default
+        val = int(val_raw)
+        if val < min_v or val > max_v:
+            logger.warning(f"{name} out of bounds ({val}); clamping to range {min_v}-{max_v}")
+            val = max(min_v, min(val, max_v))
+        return val
 
     def is_activated(self) -> bool:
-        # Single source of truth is DB; cache for quick access
         self._active_cache = self.db.is_activated()
         return self._active_cache
 
     async def start(self):
         await self.client.start(bot_token=self.bot_token)
+        # Event handlers
         self.client.add_event_handler(self.handle_chat_actions, events.ChatAction)
         self.client.add_event_handler(self.handle_new_message, events.NewMessage)
-        logger.info("Event handlers registered; bot running")
+        self.client.add_event_handler(self.handle_message_edit, events.MessageEdited)
+        logger.info("Event handlers registered.")
+        # Salt rotation background (if enabled)
+        if self.rotation_enabled:
+            asyncio.create_task(self.salt_rotation_worker())
+            logger.info("Salt rotation worker started (daily).")
 
-    # ----------------------------
-    # Event Handlers
-    # ----------------------------
+    async def salt_rotation_worker(self):
+        while True:
+            try:
+                rotated = self.db.rotate_salt_if_due()
+                if rotated:
+                    # Refresh banned words just in case (not strictly needed)
+                    self.banned_words = self.db.get_banned_words()
+                await asyncio.sleep(3600)  # check hourly
+            except Exception as e:
+                logger.error(f"Salt rotation worker error: {e}")
+                await asyncio.sleep(3600)
+
+    # ------------- Event Handlers -------------
     async def handle_chat_actions(self, event):
-        # Guard: no moderation until activated
+        if event.chat_id != self.allowed_group_id:
+            return
         if not self.is_activated():
             return
         try:
-            # Only process join events (kick users with no username)
-            if not hasattr(event, 'action_message') or not event.action_message:
+            if not hasattr(event, "action_message") or not event.action_message:
                 return
-
             action = event.action_message.action
-            users = []
-            if hasattr(action, 'users'):
-                users = action.users
-            elif hasattr(event.action_message, 'from_id') and event.action_message.from_id:
-                if hasattr(event.action_message.from_id, 'user_id'):
-                    users = [event.action_message.from_id.user_id]
-                else:
-                    return
-            else:
+            if not action:
                 return
-
+            users = []
+            if hasattr(action, "users"):
+                users = action.users
+            elif hasattr(event.action_message, "from_id") and event.action_message.from_id:
+                if hasattr(event.action_message.from_id, "user_id"):
+                    users = [event.action_message.from_id.user_id]
             for user_id in users:
                 try:
                     user = await self.client.get_entity(user_id)
-                    if getattr(user, 'bot', False):
+                    if getattr(user, "bot", False):
                         continue
-                    if not getattr(user, 'username', None):
+                    if not getattr(user, "username", None):
                         logger.info(f"Kicking user {user.id} (no username)")
                         await self.kick_user(event.chat_id, user_id)
-                    else:
-                        logger.info(f"User @{user.username} joined (has username) - allowed")
-                except Exception as e:
-                    logger.error(f"Error processing new member {user_id}: {e}")
+                except Exception as ex:
+                    logger.error(f"Join processing error for {user_id}: {ex}")
         except Exception as e:
             logger.error(f"Error in handle_chat_actions: {e}")
 
     async def handle_new_message(self, event):
+        if not event.is_private and event.chat_id != self.allowed_group_id:
+            return
         try:
-            # Distinguish private vs group
             if event.is_private:
                 await self.handle_private_dm(event)
                 return
-
-            # Group message moderation only if activated
             if not self.is_activated():
                 return
-
-            # For group messages: do not reply to anyone (commands disabled for non-admin group context)
-            # Refresh banned words (lightweight)
-            self.banned_words = self.db.get_banned_words()
-            text = event.raw_text or ""
-            if not text:
-                return
-
-            if self.contains_banned_words(text):
-                user_id = self._extract_user_id(event)
-                if user_id is None:
-                    return
-                logger.info(f"Banned content detected from user {user_id}; deleting message")
-                await event.delete()
-                violation_count = self.db.add_violation(user_id)
-                if violation_count == 1:
-                    logger.info(f"First violation for {user_id}: muting 12h + warning")
-                    await self.mute_user(event.chat_id, user_id, hours=12)
-                    try:
-                        warning_msg = await event.respond(
-                            "⚠️ Banned content deleted. You are muted for 12h. Second violation in 7 days => ban.",
-                            reply_to=event.message.id
-                        )
-                        asyncio.create_task(self.delete_after_delay(warning_msg, 30))
-                    except Exception as e:
-                        logger.error(f"Warn message send failed: {e}")
-                elif violation_count >= 2:
-                    logger.info(f"Second violation for {user_id}: banning permanently")
-                    await self.ban_user(event.chat_id, user_id)
+            await self._moderate_message(event)
         except Exception as e:
             logger.error(f"Error in handle_new_message: {e}")
 
-    # ----------------------------
-    # Private DM handling
-    # ----------------------------
+    async def handle_message_edit(self, event):
+        # Edited messages in allowed group must be re-scanned
+        if event.is_private:
+            return  # we only moderate group edits
+        if event.chat_id != self.allowed_group_id:
+            return
+        try:
+            if not self.is_activated():
+                return
+            await self._moderate_message(event, edited=True)
+        except Exception as e:
+            logger.error(f"Error in handle_message_edit: {e}")
+
+    # ------------- Moderation Core -------------
+    async def _moderate_message(self, event, edited: bool = False):
+        # Combine text and (optional) caption if any (Telethon raw_text usually covers)
+        text = event.raw_text or ""
+        if not text:
+            return
+        # Refresh banned words (simple approach)
+        self.banned_words = self.db.get_banned_words()
+        if self.contains_banned_words(text):
+            user_id = self._extract_user_id(event)
+            if user_id is None:
+                return
+            logger.info(f"Banned content ({'edited' if edited else 'new'}) from user {user_id}; deleting.")
+            try:
+                await event.delete()
+            except Exception as e:
+                logger.error(f"Failed to delete offending message: {e}")
+            violation_count = self.db.add_violation(user_id)
+            if violation_count == 1:
+                await self._first_violation_action(event, user_id)
+            elif violation_count >= 2:
+                await self._second_violation_action(event, user_id)
+
+    async def _first_violation_action(self, event, user_id: int):
+        logger.info(f"First violation -> mute 12h: user {user_id}")
+        await self.mute_user(event.chat_id, user_id, hours=12)
+        try:
+            warn = await event.respond(
+                "⚠️ Banned content removed. You are muted for 12h. Second violation within 7 days => permanent ban.",
+                reply_to=event.message.id if event.message else None
+            )
+            asyncio.create_task(self.delete_after_delay(warn, 30))
+        except Exception as e:
+            logger.error(f"Warning message failed: {e}")
+
+    async def _second_violation_action(self, event, user_id: int):
+        logger.info(f"Second violation -> permanent ban: user {user_id}")
+        await self.ban_user(event.chat_id, user_id)
+
+    # ------------- Private DM Handling -------------
     async def handle_private_dm(self, event):
-        """Only admins receive responses. Non-admin DMs are ignored completely."""
         user_id = self._extract_user_id(event)
         if user_id is None:
             return
+
+        # Non-admin DM spam tracking
         if user_id not in self.admin_ids:
-            return  # Silent ignore
+            await self._handle_dm_spam(user_id)
+            return
 
         text = (event.raw_text or "").strip()
         if not text:
             return
+        lower = text.lower()
 
-        # Activation attempt
-        if text.lower() == "activate":
+        if lower == "activate":
             if self.is_activated():
                 await self.safe_reply(event, "Already active.")
             else:
                 self.db.set_activated()
                 self._active_cache = True
-                logger.info(f"Bot activated by admin {user_id}")
+                logger.info(f"Activated by admin {user_id}")
                 await self.safe_reply(event, "Activated.")
             return
 
-        # /orwell command (multi-add)
-        if text.lower().startswith("/orwell"):
-            await self.handle_orwell_command(event, text)
+        if lower.startswith("/orwell"):
+            await self.handle_orwell(event, text)
             return
 
-        # Any other admin DM -> help
+        if lower == "/status":
+            await self.handle_status(event)
+            return
+
         await self.safe_reply(event, self.HELP_TEXT)
 
-    async def handle_orwell_command(self, event, message_text: str):
-        """
-        /orwell <word>
-        /orwell word1,word2,word3
-        """
-        # Remove the command token
-        parts = message_text.strip().split(maxsplit=1)
+    async def _handle_dm_spam(self, user_id: int):
+        count, actioned = self.db.record_dm(user_id, self.dm_spam_window_days)
+        if not actioned and count > self.dm_spam_threshold:
+            logger.info(f"DM spam threshold exceeded by user {user_id}; banning from allowed group and blocking.")
+            # Ban from allowed group only (single-group design)
+            try:
+                await self.ban_user(self.allowed_group_id, user_id)
+            except Exception as e:
+                logger.error(f"Failed banning spammer {user_id}: {e}")
+            # Block user
+            try:
+                await self.client(functions.contacts.BlockRequest(user_id))
+            except Exception as e:
+                logger.error(f"Failed blocking user {user_id}: {e}")
+            self.db.mark_dm_spam_actioned(user_id)
+
+    # ------------- Commands -------------
+    async def handle_orwell(self, event, raw: str):
+        parts = raw.strip().split(maxsplit=1)
         if len(parts) == 1:
             await self.safe_reply(event, "Usage: /orwell word OR /orwell word1,word2,word3")
             return
         payload = parts[1].strip()
-        # Split by commas OR treat as single token
-        raw_tokens = [t.strip() for t in payload.split(",")]
-        tokens = [t for t in raw_tokens if t]
-
+        tokens = [t.strip() for t in payload.split(",") if t.strip()]
         if not tokens:
             await self.safe_reply(event, "No valid words provided.")
             return
-
         added, existing = self.db.add_banned_words(tokens)
-        # Refresh in-memory cache
         self.banned_words = self.db.get_banned_words()
-
-        segments = []
+        segs = []
         if added:
-            segments.append("Added: " + ", ".join(added))
+            segs.append("Added: " + ", ".join(added))
         if existing:
-            segments.append("Skipped: " + ", ".join(existing))
-        if not segments:
-            segments.append("No changes.")
-        await self.safe_reply(event, " | ".join(segments))
+            segs.append("Skipped: " + ", ".join(existing))
+        if not segs:
+            segs.append("No changes.")
+        await self.safe_reply(event, " | ".join(segs))
 
-    # ----------------------------
-    # Utility methods
-    # ----------------------------
+    async def handle_status(self, event):
+        activated, activated_at = self.db.get_activation_row()
+        activation_str = "Active" if activated else "Inactive"
+        banned_count = len(self.banned_words)
+        vio_7d = self.db.get_violation_aggregate()
+        spam_stats = self.db.get_dm_spam_aggregate(self.dm_spam_window_days)
+        salt_mode = "Fixed (env)" if not self.rotation_enabled else "Rotating (24h)"
+        next_rot = self.db.next_rotation_eta() if self.rotation_enabled else "N/A"
+
+        msg = (
+            "📊 Status\n"
+            f"- Activation: {activation_str} (since {activated_at})\n"
+            f"- Allowed group: {self.allowed_group_id}\n"
+            f"- Banned words: {banned_count}\n"
+            f"- Violations (last 7d messages flagged): {vio_7d}\n"
+            f"- DM Spam total (window): {spam_stats['total']} | Actioned: {spam_stats['actioned']}\n"
+            f"- Salt mode: {salt_mode}\n"
+            f"- Next rotation (UTC): {next_rot}\n"
+            f"- Hash function: keyed blake2b/256\n"
+            f"- Substring scan: ENABLED\n"
+        )
+        await self.safe_reply(event, msg)
+
+    # ------------- Utilities -------------
     def _extract_user_id(self, event):
         try:
-            if hasattr(event.message, 'from_id') and event.message.from_id:
-                if hasattr(event.message.from_id, 'user_id'):
+            if hasattr(event.message, "from_id") and event.message.from_id:
+                if hasattr(event.message.from_id, "user_id"):
                     return event.message.from_id.user_id
-                # Sometimes it's already an int
                 if isinstance(event.message.from_id, int):
                     return event.message.from_id
         except Exception:
@@ -487,25 +733,32 @@ class TelegramAdminBot:
             logger.error(f"Reply failed: {e}")
 
     def contains_banned_words(self, text: str) -> bool:
+        """
+        Detection:
+          1. Token scan (word boundary) – exact tokens
+          2. Substring scan – any banned word as substring inside the text (aggressive)
+        Substring reasoning: catches attempts like splitting punctuation or adding suffix/prefix.
+        False positives possible (e.g. 'classical' contains 'ass').
+        """
         if not text or not self.banned_words:
             return False
-        text_lower = text.lower()
-        # Word boundary check
-        words = re.findall(r'\b\w+\b', text_lower)
-        for w in words:
-            if w in self.banned_words:
+        lower = text.lower()
+        # Word-boundary tokens
+        tokens = re.findall(r"\b\w+\b", lower)
+        for t in tokens:
+            if t in self.banned_words:
                 return True
-        # Substring fallback (optional)
+        # Substring fallback
         for bw in self.banned_words:
-            if bw in text_lower:
+            if bw in lower:
                 return True
         return False
 
     async def mute_user(self, chat_id: int, user_id: int, hours: int = 12):
         try:
-            mute_until = datetime.now() + timedelta(hours=hours)
-            ban_rights = ChatBannedRights(
-                until_date=mute_until,
+            until = datetime.utcnow() + timedelta(hours=hours)
+            rights = ChatBannedRights(
+                until_date=until,
                 send_messages=True,
                 send_media=True,
                 send_stickers=True,
@@ -514,42 +767,42 @@ class TelegramAdminBot:
                 send_inline=True,
                 embed_links=True
             )
-            await self.client.edit_permissions(chat_id, user_id, ban_rights)
+            await self.client.edit_permissions(chat_id, user_id, rights)
         except (ChatAdminRequiredError, UserAdminInvalidError):
             logger.error(f"Missing admin perms to mute {user_id}")
         except FloodWaitError as e:
-            logger.warning(f"Flood wait {e.seconds}s while muting")
+            logger.warning(f"Flood wait {e.seconds}s muting {user_id}")
             await asyncio.sleep(e.seconds)
         except Exception as e:
-            logger.error(f"Error muting {user_id}: {e}")
+            logger.error(f"Mute error {user_id}: {e}")
 
     async def delete_after_delay(self, message, delay_seconds: int):
         try:
             await asyncio.sleep(delay_seconds)
             await message.delete()
         except Exception as e:
-            logger.error(f"Delay delete failed: {e}")
+            logger.error(f"Ephemeral delete failed: {e}")
 
     async def kick_user(self, chat_id: int, user_id: int):
         try:
-            ban_rights = ChatBannedRights(
-                until_date=datetime.now() + timedelta(seconds=30),
+            rights = ChatBannedRights(
+                until_date=datetime.utcnow() + timedelta(seconds=30),
                 view_messages=True
             )
-            await self.client.edit_permissions(chat_id, user_id, ban_rights)
+            await self.client.edit_permissions(chat_id, user_id, rights)
             await asyncio.sleep(1)
             await self.client.edit_permissions(chat_id, user_id, None)
         except (ChatAdminRequiredError, UserAdminInvalidError):
             logger.error(f"Missing admin perms to kick {user_id}")
         except FloodWaitError as e:
-            logger.warning(f"Flood wait {e.seconds}s while kicking")
+            logger.warning(f"Flood wait {e.seconds}s kicking {user_id}")
             await asyncio.sleep(e.seconds)
         except Exception as e:
-            logger.error(f"Error kicking {user_id}: {e}")
+            logger.error(f"Kick error {user_id}: {e}")
 
     async def ban_user(self, chat_id: int, user_id: int):
         try:
-            ban_rights = ChatBannedRights(
+            rights = ChatBannedRights(
                 until_date=None,
                 view_messages=True,
                 send_messages=True,
@@ -560,22 +813,22 @@ class TelegramAdminBot:
                 send_inline=True,
                 embed_links=True
             )
-            await self.client.edit_permissions(chat_id, user_id, ban_rights)
+            await self.client.edit_permissions(chat_id, user_id, rights)
         except (ChatAdminRequiredError, UserAdminInvalidError):
             logger.error(f"Missing admin perms to ban {user_id}")
         except FloodWaitError as e:
-            logger.warning(f"Flood wait {e.seconds}s while banning")
+            logger.warning(f"Flood wait {e.seconds}s banning {user_id}")
             await asyncio.sleep(e.seconds)
         except Exception as e:
-            logger.error(f"Error banning {user_id}: {e}")
+            logger.error(f"Ban error {user_id}: {e}")
 
     async def run(self):
         await self.start()
         await self.client.run_until_disconnected()
 
-# ----------------------------
+# -----------------------------
 # Entry point
-# ----------------------------
+# -----------------------------
 async def main():
     try:
         bot = TelegramAdminBot()
