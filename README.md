@@ -1,4 +1,5 @@
-# ⚔️ XController – Secure Telegram Moderation Bot (Single-Group, Hardened)
+# ⚔️ XController – Secure Telegram Moderation Bot (Single-Group, Hardened) 
+# Pruned and Hardened version
 
 > Ultra-focused, security‑centric moderation bot for ONE Telegram group.  
 > Passive until explicitly activated. Encrypted, anonymized, rate-aware, salt-rotating.  
