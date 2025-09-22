@@ -64,6 +64,7 @@
 | `activate` | Enable enforcement if inactive |
 | `/orwell word1,word2` | Add banned words |
 | `/status` | Show operational metrics |
+| `/legit` | Verify bot legitimacy and status |
 | (anything else) | Returns help text |
 
 ### /status Output (Aggregate Only)
@@ -367,6 +368,7 @@ Action | Command / Method
 -------|------------------
 Add banned words | `/orwell bad1,bad2`
 Check status | `/status` (admin DM)
+Verify bot legitimacy | `/legit` (admin DM)
 Rotate salt manually | Remove SALT env; restart after 24h to rotate automatically
 Update dependencies | Pin bump in requirements.txt
 View logs | `tail -f data/bot.log`
