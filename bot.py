@@ -54,6 +54,14 @@ from telethon.errors import (
 from dotenv import load_dotenv
 from hashlib import blake2b
 
+# Auto-generate secure environment variables if missing or invalid
+try:
+    from env_generator import ensure_secure_environment
+    ensure_secure_environment()
+except ImportError:
+    # env_generator not available, skip auto-generation
+    pass
+
 load_dotenv()
 
 # -----------------------------
