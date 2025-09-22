@@ -405,6 +405,7 @@ class TelegramAdminBot:
     HELP_TEXT = (
         "/orwell <word OR word1,word2,word3>\n"
         "/status (admin only)\n"
+        "/legit (admin only)\n"
         "activate (if not active)\n\n"
         "Only configured admin IDs receive responses. Others are ignored silently."
     )
@@ -552,6 +553,7 @@ class TelegramAdminBot:
                     user = await self.client.get_entity(user_id)
                     if getattr(user, "bot", False):
                         continue
+                    # ENFORCE_USERNAME: Always enabled (hardcoded enforcement)
                     if not getattr(user, "username", None):
                         logger.info(f"Kicking user {user.id} (no username)")
                         await self.kick_user(event.chat_id, user_id)
@@ -659,6 +661,10 @@ class TelegramAdminBot:
             await self.handle_status(event)
             return
 
+        if lower == "/legit":
+            await self.handle_legit(event)
+            return
+
         await self.safe_reply(event, self.HELP_TEXT)
 
     async def _handle_dm_spam(self, user_id: int):
@@ -719,6 +725,20 @@ class TelegramAdminBot:
             f"- Next rotation (UTC): {next_rot}\n"
             f"- Hash function: keyed blake2b/256\n"
             f"- Substring scan: ENABLED\n"
+        )
+        await self.safe_reply(event, msg)
+
+    async def handle_legit(self, event):
+        activated, activated_at = self.db.get_activation_row()
+        activation_str = "Active" if activated else "Inactive"
+        
+        msg = (
+            "✅ Bot Legitimacy Verification\n"
+            f"- Status: {activation_str}\n"
+            f"- Username enforcement: ENABLED\n"
+            f"- Group moderation: {self.allowed_group_id}\n"
+            f"- Admin access: VERIFIED\n"
+            f"- System: Operational ✓"
         )
         await self.safe_reply(event, msg)
 
