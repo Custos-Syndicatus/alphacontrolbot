@@ -12,9 +12,18 @@ def check_environment():
     """Check if all required environment variables are set"""
     print("🔍 Checking environment configuration...")
     
+    # Auto-generate secure environment variables if needed
+    try:
+        from env_generator import ensure_secure_environment
+        if not ensure_secure_environment():
+            print("⚠️  Environment auto-generation encountered issues")
+    except ImportError:
+        print("⚠️  Environment auto-generation not available")
+    
     load_dotenv()
     
-    required_vars = ['API_ID', 'API_HASH', 'BOT_TOKEN', 'SALT']
+    # Core required variables (SALT is now optional - auto-generated if missing)
+    required_vars = ['API_ID', 'API_HASH', 'BOT_TOKEN']
     missing_vars = []
     
     for var in required_vars:
@@ -28,12 +37,37 @@ def check_environment():
     
     print("✅ All required environment variables are set")
     
-    # Check SALT length for security
-    salt = os.getenv('SALT', '')
-    if len(salt) < 16:
-        print("⚠️  SALT should be at least 16 characters for security")
-    else:
-        print("✅ SALT configured with adequate length")
+    # Check security-critical variables using env_generator logic
+    try:
+        from env_generator import EnvGenerator
+        generator = EnvGenerator()
+        
+        # Check DB_PASSPHRASE
+        db_passphrase = os.getenv('DB_PASSPHRASE', '')
+        if generator.is_value_invalid('DB_PASSPHRASE', db_passphrase):
+            print("⚠️  DB_PASSPHRASE should be replaced with a secure value")
+        else:
+            print("✅ DB_PASSPHRASE configured securely")
+            
+        # Check SALT
+        salt = os.getenv('SALT', '')
+        if salt:
+            if generator.is_value_invalid('SALT', salt):
+                print("⚠️  SALT should be a valid hex string (at least 32 characters)")
+            else:
+                print("✅ SALT configured with secure value")
+        else:
+            print("💡 SALT not set - bot will use rotating salt mode")
+            
+    except ImportError:
+        # Fallback to basic checks if env_generator not available
+        salt = os.getenv('SALT', '')
+        if salt and len(salt) < 16:
+            print("⚠️  SALT should be at least 16 characters for security")
+        elif salt:
+            print("✅ SALT configured with adequate length")
+        else:
+            print("💡 SALT not set - bot will use rotating salt mode")
     
     # Check optional variables
     banned_words = os.getenv('BANNED_WORDS', '')

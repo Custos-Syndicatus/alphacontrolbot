@@ -134,6 +134,31 @@ Cons: can cause false positives (`classical` contains `ass`).
 
 If `SALT` omitted → rotating-salt mode engages automatically.
 
+### 🔐 Automatic Security Value Generation
+
+The bot automatically generates secure values for critical environment variables when they are missing or contain placeholder values. This happens during bot startup:
+
+| Variable | Auto-Generated When | Generated Value |
+|----------|-------------------|-----------------|
+| `DB_PASSPHRASE` | Missing, empty, or contains `change_this_to_a_strong_random_passphrase` | 32-byte URL-safe random string |
+| `SALT` | Missing, empty, too short, or invalid hex | 32-byte hex string (64 characters) |
+
+**Placeholder values that trigger auto-generation:**
+- `change_this_to_a_strong_random_passphrase`
+- `your_api_hash_here`
+- `strongpassphrase`
+- Empty values
+- Values shorter than minimum security requirements
+
+**Auto-generation process:**
+1. ✅ Bot checks `.env` file during startup
+2. 🔍 Detects missing or invalid security-critical values
+3. 🔐 Generates cryptographically secure replacements using `secrets` module
+4. 📝 Updates `.env` file with new values while preserving comments and structure
+5. ♻️ Reloads environment variables for current session
+
+**Note:** This ensures that even users who forget to replace placeholder values will have a secure bot configuration. The generated values are saved to `.env` so they persist across restarts.
+
 ---
 
 ## 📦 Installation (Linux Example)
@@ -205,6 +230,8 @@ docker-compose up -d
 - **Protect admin user IDs** – Only trusted users should have control
 - **Secure host access** – Limit SSH/access to Docker host
 - **Regular backups** – Backup `./data` directory if using fixed SALT
+- **Auto-generated values are secure** – The bot automatically generates cryptographically secure values for missing credentials using Python's `secrets` module
+- **Review generated `.env`** – After first run, verify auto-generated values meet your security requirements
 
 ### Docker Commands
 
